@@ -58,6 +58,21 @@ void openfish_decode_cpu(
     char **qstring
 );
 
+void openfish_rotary_emb_cpu(
+    void *x,
+    const void *sin_buf,
+    const void *cos_buf,
+    int batch_size,
+    int seq_len,
+    int n_heads,
+    int head_dim,
+    int rotary_half,
+    int stride_batch,
+    int stride_seq,
+    int stride_head,
+    int n_threads
+);
+
 size_t openfish_gpubuf_size(
     int n_timesteps,
     int batch_size,
@@ -92,6 +107,90 @@ void openfish_gpubuf_free(
 );
 
 #endif // defined(HAVE_CUDA) || defined(HAVE_ROCM) || defined(HAVE_METAL)
+
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
+
+void openfish_rotary_emb_gpu(
+    void *x,
+    const void *sin_gpu,
+    const void *cos_gpu,
+    int batch_size,
+    int seq_len,
+    int n_heads,
+    int head_dim,
+    int rotary_half,
+    int stride_batch,
+    int stride_seq,
+    int stride_head
+);
+
+void openfish_flstm_step_gpu(
+    const void* scratch,
+    const void* ih_t,
+    void* cell,
+    void* hh_next,
+    int batch_size,
+    int hidden_dim
+);
+
+void openfish_silu_mul_gpu(
+    const void *in,
+    void *out,
+    int n_tokens,
+    int hidden_dim
+);
+
+void openfish_rmsnorm_gpu(
+    const void* in,
+    const void* residual,
+    const void* weight,
+    void* out,
+    int n_tokens,
+    int hidden_dim,
+    float alpha,
+    float eps
+);
+
+void openfish_rmsnorm_quant_int8_gpu(
+    const void* in,
+    const void* weight,
+    void* residual,
+    void* residual_scale,
+    int n_tokens,
+    int hidden_dim,
+    float alpha,
+    float eps
+);
+
+void openfish_rmsnorm_quant_fp8_gpu(
+    const void* in,
+    const void* weight,
+    void* residual,
+    void* residual_scale,
+    int n_tokens,
+    int hidden_dim,
+    float alpha,
+    float eps
+);
+
+void openfish_quant_fp8_gpu(
+    const void* in,
+    void*       out,
+    void*       scale,
+    int         n_tokens,
+    int         hidden_dim
+);
+
+void openfish_dequant_fp8_transpose_gpu(
+    const void* in,
+    void*       out,
+    int         n_timesteps,
+    int         batch_size,
+    int         n_channels,
+    float       scale
+);
+
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
 #ifdef __cplusplus
 }
