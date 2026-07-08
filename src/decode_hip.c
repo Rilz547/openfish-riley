@@ -4,11 +4,42 @@
 #include "beam_search_hip.h"
 #include "error.h"
 #include "hip_utils.h"
+#include "misc.h"
 
 #include <openfish/openfish_error.h>
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+
+static void openfish_decode_stats_note_dims(
+    openfish_decode_stats_t *stats,
+    int n_timesteps,
+    int batch_size,
+    int n_channels
+) {
+    if (stats == NULL) {
+        return;
+    }
+    stats->n_timesteps = n_timesteps;
+    stats->batch_size = batch_size;
+    stats->n_channels = n_channels;
+}
+
+#define OPENFISH_TIME_SECTION(stats_ptr, field, ...) \
+    do { \
+        double _openfish_t0 = 0.0; \
+        double _openfish_t1 = 0.0; \
+        hipError_t _openfish_ret = hipSuccess; \
+        if ((stats_ptr) != NULL) { \
+            _openfish_t0 = openfish_realtime(); \
+        } \
+        __VA_ARGS__ \
+        if ((stats_ptr) != NULL) { \
+            _openfish_t1 = openfish_realtime(); \
+            (stats_ptr)->field += _openfish_t1 - _openfish_t0; \
+        } \
+        (void)_openfish_ret; \
+    } while (0)
 
 
 openfish_gpubuf_t *openfish_gpubuf_init(
@@ -93,7 +124,8 @@ void openfish_decode_gpu(
     const openfish_gpubuf_t *gpubuf,
     uint8_t **moves,
     char **sequence,
-    char **qstring
+    char **qstring,
+    openfish_decode_stats_t *stats
 ) {
     hipError_t ret;
     const int num_states = pow(NUM_BASES, state_len);
@@ -113,6 +145,7 @@ void openfish_decode_gpu(
 	dim3 grid_size(batch_size, 1, 1);
 
     OPENFISH_LOG_TRACE("scores tensor dim (NTC): %d, %d, %d", batch_size, n_timesteps, n_channels);
+    openfish_decode_stats_note_dims(stats, n_timesteps, batch_size, n_channels);
 
     scan_params_t scan_args = {0};
     scan_args.n_timesteps = n_timesteps;
@@ -161,80 +194,97 @@ void openfish_decode_gpu(
     // score element type. the f16 path passes score_scale = 1.0 and is numerically unchanged.
     OPENFISH_LOG_TRACE("bwd scan / beam search / fwd + post scan (score_dtype=%d)...", (int)score_dtype);
     if (score_dtype == OPENFISH_SCORE_I8) {
-        bwd_scan<int8_t><<<grid_size,block_size>>>(scan_args, scores_NTC, gpubuf->bwd_NTC);
-        checkHipError();
-        ret = hipDeviceSynchronize();
-        checkHipError(); HIP_CHECK(ret);
-
-        beam_search<int8_t><<<grid_size,block_size_beam,num_states*sizeof(float)>>>(
-            beam_args, scores_NTC, gpubuf->bwd_NTC,
-            (state_t *)gpubuf->states, gpubuf->moves, (beam_element_t *)gpubuf->beam_vector,
-            beam_cut, fixed_stay_score, score_scale
+        OPENFISH_TIME_SECTION(stats, time_bwd_scan,
+            bwd_scan<int8_t><<<grid_size,block_size>>>(scan_args, scores_NTC, gpubuf->bwd_NTC);
+            checkHipError();
+            ret = hipDeviceSynchronize();
+            checkHipError(); HIP_CHECK(ret);
         );
-        checkHipError();
-        ret = hipDeviceSynchronize();
-        checkHipError(); HIP_CHECK(ret);
 
-        fwd_post_scan<int8_t><<<grid_size,block_size>>>(scan_args, scores_NTC, gpubuf->bwd_NTC, gpubuf->post_NTC);
-        checkHipError();
-        ret = hipDeviceSynchronize();
-        checkHipError(); HIP_CHECK(ret);
+        OPENFISH_TIME_SECTION(stats, time_beam_search,
+            beam_search<int8_t><<<grid_size,block_size_beam,num_states*sizeof(float)>>>(
+                beam_args, scores_NTC, gpubuf->bwd_NTC,
+                (state_t *)gpubuf->states, gpubuf->moves, (beam_element_t *)gpubuf->beam_vector,
+                beam_cut, fixed_stay_score, score_scale
+            );
+            checkHipError();
+            ret = hipDeviceSynchronize();
+            checkHipError(); HIP_CHECK(ret);
+        );
+
+        OPENFISH_TIME_SECTION(stats, time_fwd_post_scan,
+            fwd_post_scan<int8_t><<<grid_size,block_size>>>(scan_args, scores_NTC, gpubuf->bwd_NTC, gpubuf->post_NTC);
+            checkHipError();
+            ret = hipDeviceSynchronize();
+            checkHipError(); HIP_CHECK(ret);
+        );
     } else {
-        bwd_scan<half><<<grid_size,block_size>>>(scan_args, scores_NTC, gpubuf->bwd_NTC);
-        checkHipError();
-        ret = hipDeviceSynchronize();
-        checkHipError(); HIP_CHECK(ret);
-
-        beam_search<half><<<grid_size,block_size_beam,num_states*sizeof(float)>>>(
-            beam_args, scores_NTC, gpubuf->bwd_NTC,
-            (state_t *)gpubuf->states, gpubuf->moves, (beam_element_t *)gpubuf->beam_vector,
-            beam_cut, fixed_stay_score, score_scale
+        OPENFISH_TIME_SECTION(stats, time_bwd_scan,
+            bwd_scan<half><<<grid_size,block_size>>>(scan_args, scores_NTC, gpubuf->bwd_NTC);
+            checkHipError();
+            ret = hipDeviceSynchronize();
+            checkHipError(); HIP_CHECK(ret);
         );
-        checkHipError();
-        ret = hipDeviceSynchronize();
-        checkHipError(); HIP_CHECK(ret);
 
-        fwd_post_scan<half><<<grid_size,block_size>>>(scan_args, scores_NTC, gpubuf->bwd_NTC, gpubuf->post_NTC);
-        checkHipError();
-        ret = hipDeviceSynchronize();
-        checkHipError(); HIP_CHECK(ret);
+        OPENFISH_TIME_SECTION(stats, time_beam_search,
+            beam_search<half><<<grid_size,block_size_beam,num_states*sizeof(float)>>>(
+                beam_args, scores_NTC, gpubuf->bwd_NTC,
+                (state_t *)gpubuf->states, gpubuf->moves, (beam_element_t *)gpubuf->beam_vector,
+                beam_cut, fixed_stay_score, score_scale
+            );
+            checkHipError();
+            ret = hipDeviceSynchronize();
+            checkHipError(); HIP_CHECK(ret);
+        );
+
+        OPENFISH_TIME_SECTION(stats, time_fwd_post_scan,
+            fwd_post_scan<half><<<grid_size,block_size>>>(scan_args, scores_NTC, gpubuf->bwd_NTC, gpubuf->post_NTC);
+            checkHipError();
+            ret = hipDeviceSynchronize();
+            checkHipError(); HIP_CHECK(ret);
+        );
     }
 
     OPENFISH_LOG_TRACE("%s", "compute qual data...");
-    compute_qual_data<<<grid_size,block_size_gen>>>(
-        beam_args,
-        gpubuf->post_NTC,
-        (state_t *)gpubuf->states,
-        gpubuf->qual_data,
-        1.0f
+    OPENFISH_TIME_SECTION(stats, time_qual_data,
+        compute_qual_data<<<grid_size,block_size_gen>>>(
+            beam_args,
+            gpubuf->post_NTC,
+            (state_t *)gpubuf->states,
+            gpubuf->qual_data,
+            1.0f
+        );
+        checkHipError();
+        ret = hipDeviceSynchronize();
+        checkHipError(); HIP_CHECK(ret);
     );
-    checkHipError();
-    ret = hipDeviceSynchronize();
-    checkHipError(); HIP_CHECK(ret);
 
     OPENFISH_LOG_TRACE("%s", "gen sequence...");
-    generate_sequence<<<grid_size,block_size_gen>>>(
-        beam_args,
-        gpubuf->moves,
-        (state_t *)gpubuf->states,
-        gpubuf->qual_data,
-        gpubuf->base_probs,
-        gpubuf->total_probs,
-        gpubuf->sequence,
-        gpubuf->qstring,
-        q_shift,
-        q_scale
+    OPENFISH_TIME_SECTION(stats, time_gen_sequence,
+        generate_sequence<<<grid_size,block_size_gen>>>(
+            beam_args,
+            gpubuf->moves,
+            (state_t *)gpubuf->states,
+            gpubuf->qual_data,
+            gpubuf->base_probs,
+            gpubuf->total_probs,
+            gpubuf->sequence,
+            gpubuf->qstring,
+            q_shift,
+            q_scale
+        );
+        checkHipError();
+        ret = hipDeviceSynchronize();
+        checkHipError(); HIP_CHECK(ret);
     );
-    checkHipError();
-    ret = hipDeviceSynchronize();
-    checkHipError(); HIP_CHECK(ret);
 
-    // copy beam_search results
-    ret = hipMemcpy(*moves, gpubuf->moves, sizeof(uint8_t) * batch_size * n_timesteps, hipMemcpyDeviceToHost);
-    checkHipError(); HIP_CHECK(ret);
-	ret = hipMemcpy(*sequence, gpubuf->sequence, sizeof(char) * batch_size * n_timesteps, hipMemcpyDeviceToHost);
-    checkHipError(); HIP_CHECK(ret);
-    ret = hipMemcpy(*qstring, gpubuf->qstring, sizeof(char) * batch_size * n_timesteps, hipMemcpyDeviceToHost);
-    checkHipError(); HIP_CHECK(ret);
+    OPENFISH_TIME_SECTION(stats, time_d2h_copy,
+        ret = hipMemcpy(*moves, gpubuf->moves, sizeof(uint8_t) * batch_size * n_timesteps, hipMemcpyDeviceToHost);
+        checkHipError(); HIP_CHECK(ret);
+        ret = hipMemcpy(*sequence, gpubuf->sequence, sizeof(char) * batch_size * n_timesteps, hipMemcpyDeviceToHost);
+        checkHipError(); HIP_CHECK(ret);
+        ret = hipMemcpy(*qstring, gpubuf->qstring, sizeof(char) * batch_size * n_timesteps, hipMemcpyDeviceToHost);
+        checkHipError(); HIP_CHECK(ret);
+    );
 }
 

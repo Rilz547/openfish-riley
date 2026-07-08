@@ -41,6 +41,20 @@ typedef enum {
     OPENFISH_SCORE_I8  = 1
 } openfish_score_dtype_t;
 
+typedef struct openfish_decode_stats {
+    double time_bwd_scan;
+    double time_beam_search;
+    double time_fwd_post_scan;
+    double time_qual_data;
+    double time_gen_sequence;
+    double time_d2h_copy;
+    int n_timesteps;
+    int batch_size;
+    int n_channels;
+} openfish_decode_stats_t;
+
+void openfish_decode_stats_reset(openfish_decode_stats_t *stats);
+
 openfish_opt_t openfish_decoder_default_opts(void);
 
 void openfish_decode_cpu(
@@ -55,7 +69,8 @@ void openfish_decode_cpu(
     const openfish_opt_t *options,
     uint8_t **moves,
     char **sequence,
-    char **qstring
+    char **qstring,
+    openfish_decode_stats_t *stats
 );
 
 void openfish_rotary_emb_cpu(
@@ -93,7 +108,8 @@ void openfish_decode_gpu(
     const openfish_gpubuf_t *gpubuf,
     uint8_t **moves,
     char **sequence,
-    char **qstring
+    char **qstring,
+    openfish_decode_stats_t *stats
 );
 
 openfish_gpubuf_t *openfish_gpubuf_init(

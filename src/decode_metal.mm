@@ -180,9 +180,11 @@ extern "C" void openfish_decode_gpu(
     const openfish_gpubuf_t *gpubuf,
     uint8_t **moves,
     char **sequence,
-    char **qstring
+    char **qstring,
+    openfish_decode_stats_t *stats
 ) {
     ensure_metal_init();
+    (void)stats;
 
     // The Metal path currently supports float16 scores only; int8 decode is
     // wired for the CUDA/HIP backends. score_scale is honored in the beam search.

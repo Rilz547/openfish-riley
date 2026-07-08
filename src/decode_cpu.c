@@ -7,6 +7,7 @@
 
 #include <math.h>
 #include <pthread.h>
+#include <string.h>
 
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
 
@@ -150,6 +151,13 @@ static void softmax(const float *fwd, float *out, const uint64_t chunk, const ui
 }
 
 typedef struct {
+    double bwd_scan;
+    double fwd_post_scan;
+    double beam_search;
+    double gen_sequence;
+} decode_thread_times_t;
+
+typedef struct {
     const openfish_opt_t *options;
     const float *scores_NTC;
     float score_scale;
@@ -169,6 +177,7 @@ typedef struct {
     char *sequence;
     char *qstring;
     beam_element_t *beam_vector;
+    decode_thread_times_t *thread_times;
 } decode_thread_arg_t;
 
 static void* pthread_single_scan_score(void* voidargs) {
@@ -181,12 +190,30 @@ static void* pthread_single_scan_score(void* voidargs) {
     const float score_scale = args->score_scale;
 
     for (int c = args->start; c < args->end; c++) {
+        double t0 = 0.0;
+        double t1 = 0.0;
+
+        if (args->thread_times != NULL) {
+            t0 = openfish_realtime();
+        }
         backward_scan(args->scores_NTC, args->bwd_NTC, c, n_timesteps, num_states, score_scale);
+        if (args->thread_times != NULL) {
+            t1 = openfish_realtime();
+            args->thread_times->bwd_scan += t1 - t0;
+        }
+
+        if (args->thread_times != NULL) {
+            t0 = openfish_realtime();
+        }
         // forward_scan writes the fwd/bwd guide product into post_NTC, then softmax
         // normalises it in place. post_NTC doubles as the forward buffer, so no
         // separate fwd_NTC allocation is needed (mirrors the fused GPU fwd_post_scan).
         forward_scan(args->scores_NTC, args->bwd_NTC, args->post_NTC, c, n_timesteps, num_states, score_scale);
         softmax(args->post_NTC, args->post_NTC, c, n_timesteps, num_states);
+        if (args->thread_times != NULL) {
+            t1 = openfish_realtime();
+            args->thread_times->fwd_post_scan += t1 - t0;
+        }
     }
 
     pthread_exit(0);
@@ -219,7 +246,17 @@ static void *pthread_single_beam_search(void *voidargs) {
         char *qstring = args->qstring + c * n_timesteps;
         beam_element_t *beam_vector = args->beam_vector + c * MAX_BEAM_WIDTH * (n_timesteps+1);
 
+        double t0 = 0.0;
+        double t1 = 0.0;
+
+        if (args->thread_times != NULL) {
+            t0 = openfish_realtime();
+        }
         openfish_beam_search_cpu(scores, n_channels, bwd, post, num_state_bits, n_timesteps, beam_cut, fixed_stay_score, states, moves, qual_data, args->score_scale, 1.0f, beam_vector);
+        if (args->thread_times != NULL) {
+            t1 = openfish_realtime();
+            args->thread_times->beam_search += t1 - t0;
+        }
 
         size_t seq_len = 0;
         for (int i = 0; i < n_timesteps; ++i) {
@@ -228,7 +265,14 @@ static void *pthread_single_beam_search(void *voidargs) {
             base_probs[i] = 0;
         }
 
+        if (args->thread_times != NULL) {
+            t0 = openfish_realtime();
+        }
         openfish_generate_sequence_cpu(moves, states, qual_data, q_shift, q_scale, n_timesteps, seq_len, base_probs, total_probs, sequence, qstring);
+        if (args->thread_times != NULL) {
+            t1 = openfish_realtime();
+            args->thread_times->gen_sequence += t1 - t0;
+        }
     }
 
     pthread_exit(0);
@@ -246,7 +290,8 @@ void openfish_decode_cpu(
     const openfish_opt_t *options,
     uint8_t **moves,
     char **sequence,
-    char **qstring
+    char **qstring,
+    openfish_decode_stats_t *stats
 ) {
     const int num_states = pow(NUM_BASES, state_len);
 
@@ -273,6 +318,11 @@ void openfish_decode_cpu(
     }
 
     OPENFISH_LOG_TRACE("scores tensor dim (NTC): %d, %d, %d", batch_size, n_timesteps, n_channels);
+    if (stats != NULL) {
+        stats->n_timesteps = n_timesteps;
+        stats->batch_size = batch_size;
+        stats->n_channels = n_channels;
+    }
 
     float *bwd_NTC = (float *)calloc(batch_size * (n_timesteps + 1) * num_states, sizeof(float));
     float *post_NTC = (float *)calloc(batch_size * (n_timesteps + 1) * num_states, sizeof(float));
@@ -312,7 +362,10 @@ void openfish_decode_cpu(
 
     pthread_t tids[n_threads];
     decode_thread_arg_t pt_args[n_threads];
+    decode_thread_times_t thread_times[n_threads];
     int32_t t, ret;
+
+    memset(thread_times, 0, sizeof(thread_times));
 
     // set the data structures
     for (t = 0; t < n_threads; t++) {
@@ -336,6 +389,7 @@ void openfish_decode_cpu(
         pt_args[t].sequence = *sequence;
         pt_args[t].qstring = *qstring;
         pt_args[t].beam_vector = beam_vector;
+        pt_args[t].thread_times = stats != NULL ? &thread_times[t] : NULL;
     }
 
     // score tensors
@@ -349,6 +403,14 @@ void openfish_decode_cpu(
         NEG_CHK(ret);
     }
 
+    if (stats != NULL) {
+        for (t = 0; t < n_threads; t++) {
+            stats->time_bwd_scan += thread_times[t].bwd_scan;
+            stats->time_fwd_post_scan += thread_times[t].fwd_post_scan;
+        }
+        memset(thread_times, 0, sizeof(thread_times));
+    }
+
     // beam search
     for (t = 0; t < n_threads; t++) {
         ret = pthread_create(&tids[t], NULL, pthread_single_beam_search, (void *)(&pt_args[t]));
@@ -358,6 +420,13 @@ void openfish_decode_cpu(
     for (t = 0; t < n_threads; t++) {
         ret = pthread_join(tids[t], NULL);
         NEG_CHK(ret);
+    }
+
+    if (stats != NULL) {
+        for (t = 0; t < n_threads; t++) {
+            stats->time_beam_search += thread_times[t].beam_search;
+            stats->time_gen_sequence += thread_times[t].gen_sequence;
+        }
     }
 
 #ifdef DEBUG
