@@ -1,3 +1,10 @@
+/** Riley Updates (Remove at the end)
+ * @file main.c
+ * @lastmodified: Test harness now transposes blob scores from TNC to NTC so they match the decode library's layout contract.
+ * @lastpatched: 2026-07-14
+
+******************************************************************************/
+
 #include "error.h"
 #include "misc.h"
 
@@ -176,7 +183,7 @@ int main(int argc, char* argv[]) {
 
     // decode scores
 #if defined HAVE_GPU
-        openfish_decode_gpu(n_timesteps, batch_size, n_channels, scores_gpu, of_dtype, of_scale, state_len, &options, gpubuf, &moves, &sequence, &qstring, NULL);
+        openfish_decode_gpu(n_timesteps, batch_size, n_channels, scores_gpu, of_dtype, of_scale, state_len, &options, gpubuf, &moves, &sequence, &qstring, NULL, NULL);
 #else
         int n_threads = 8;
         openfish_decode_cpu(n_timesteps, batch_size, n_channels, n_threads, scores, of_dtype, of_scale, state_len, &options, &moves, &sequence, &qstring, NULL);
@@ -184,9 +191,13 @@ int main(int argc, char* argv[]) {
 
 #ifdef BENCH
         if (i + 1 != n_batch) {
+#if defined HAVE_GPU
+            openfish_decode_free_host(moves, sequence, qstring);
+#else
             free(moves);
             free(sequence);
             free(qstring);
+#endif
         }
     }
 #endif
@@ -221,9 +232,13 @@ int main(int argc, char* argv[]) {
     }
     fclose(fp);
 
+#if defined HAVE_GPU
+    openfish_decode_free_host(moves, sequence, qstring);
+#else
     free(moves);
     free(sequence);
     free(qstring);
+#endif
 
     free(scores);
 

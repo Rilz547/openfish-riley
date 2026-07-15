@@ -1,3 +1,10 @@
+/** Riley Updates (Remove at the end)
+ * @file decode_metal.mm
+ * @lastmodified: Updated to the shared openfish_decode_gpu signature (stream + stats); Metal still runs on the default path.
+ * @lastpatched: 2026-07-14
+
+******************************************************************************/
+
 // Metal (Apple Silicon) GPU backend for CRF-CTC decoding.
 //
 // Mirrors decode_cuda.c / decode_hip.c: one threadgroup per chunk, five compute kernels
@@ -181,10 +188,12 @@ extern "C" void openfish_decode_gpu(
     uint8_t **moves,
     char **sequence,
     char **qstring,
-    openfish_decode_stats_t *stats
+    openfish_decode_stats_t *stats,
+    void *stream
 ) {
     ensure_metal_init();
     (void)stats;
+    (void)stream;
 
     // The Metal path currently supports float16 scores only; int8 decode is
     // wired for the CUDA/HIP backends. score_scale is honored in the beam search.
@@ -371,5 +380,19 @@ extern "C" void write_gpubuf_metal(
         }
         fclose(fp);
     }
+}
+
+extern "C" void openfish_decode_free_host(
+    uint8_t *moves,
+    char *sequence,
+    char *qstring
+) {
+    free(moves);
+    free(sequence);
+    free(qstring);
+}
+
+extern "C" void openfish_decode_stats_finish(openfish_decode_stats_t *stats) {
+    (void)stats;
 }
 #endif

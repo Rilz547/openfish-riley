@@ -1,3 +1,10 @@
+/** Riley Updates (Remove at the end)
+ * @file decode_hip.c
+ * @lastmodified: Matched the shared decode API (stream argument, stats, pinned free); HIP stream overlap is stubbed for now.
+ * @lastpatched: 2026-07-14
+
+******************************************************************************/
+
 #include <openfish/openfish.h>
 #include "openfish_defs.h"
 #include "scan_hip.h"
@@ -125,8 +132,10 @@ void openfish_decode_gpu(
     uint8_t **moves,
     char **sequence,
     char **qstring,
-    openfish_decode_stats_t *stats
+    openfish_decode_stats_t *stats,
+    void *stream
 ) {
+    (void)stream; /* CUDA overlap streams; HIP stream path not wired yet */
     hipError_t ret;
     const int num_states = pow(NUM_BASES, state_len);
 
@@ -286,5 +295,19 @@ void openfish_decode_gpu(
         ret = hipMemcpy(*qstring, gpubuf->qstring, sizeof(char) * batch_size * n_timesteps, hipMemcpyDeviceToHost);
         checkHipError(); HIP_CHECK(ret);
     );
+}
+
+void openfish_decode_free_host(
+    uint8_t *moves,
+    char *sequence,
+    char *qstring
+) {
+    free(moves);
+    free(sequence);
+    free(qstring);
+}
+
+void openfish_decode_stats_finish(openfish_decode_stats_t *stats) {
+    (void)stats;
 }
 

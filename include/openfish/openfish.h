@@ -1,3 +1,10 @@
+/** Riley Updates (Remove at the end)
+ * @file openfish.h
+ * @lastmodified: Decode API now takes an optional GPU stream, exposes phase timing stats, and frees pinned host decode buffers.
+ * @lastpatched: 2026-07-14
+
+******************************************************************************/
+
 #ifndef OPENFISH_H
 #define OPENFISH_H
 
@@ -51,9 +58,15 @@ typedef struct openfish_decode_stats {
     int n_timesteps;
     int batch_size;
     int n_channels;
+    /* Internal: CUDA event pairs for async (overlap) timing. Do not touch. */
+    void *async_timing;
 } openfish_decode_stats_t;
 
 void openfish_decode_stats_reset(openfish_decode_stats_t *stats);
+
+/* After the decode stream has been synchronized, resolve CUDA-event phase timers
+ * recorded during an async (stream != NULL) openfish_decode_gpu call. */
+void openfish_decode_stats_finish(openfish_decode_stats_t *stats);
 
 openfish_opt_t openfish_decoder_default_opts(void);
 
@@ -109,7 +122,15 @@ void openfish_decode_gpu(
     uint8_t **moves,
     char **sequence,
     char **qstring,
-    openfish_decode_stats_t *stats
+    openfish_decode_stats_t *stats,
+    void *stream  /* cudaStream_t / hipStream_t; NULL = current/default stream */
+);
+
+/* Free host buffers returned by openfish_decode_gpu (CUDA uses pinned host memory). */
+void openfish_decode_free_host(
+    uint8_t *moves,
+    char *sequence,
+    char *qstring
 );
 
 openfish_gpubuf_t *openfish_gpubuf_init(

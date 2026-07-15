@@ -1,3 +1,10 @@
+/** Riley Updates (Remove at the end)
+ * @file decode_cuda.c
+ * @lastmodified: Stream-aware CUDA decode with pinned host outputs and event-based phase timing so decode can overlap inference.
+ * @lastpatched: 2026-07-14
+
+******************************************************************************/
+
 #include <openfish/openfish.h>
 #include <stdint.h>
 #include "openfish_defs.h"
@@ -10,6 +17,15 @@
 #include <openfish/openfish_error.h>
 
 #include <cuda_fp16.h>
+
+#define OPENFISH_DECODE_MAX_PHASES 8
+
+typedef struct {
+    cudaEvent_t start[OPENFISH_DECODE_MAX_PHASES];
+    cudaEvent_t end[OPENFISH_DECODE_MAX_PHASES];
+    double *accum[OPENFISH_DECODE_MAX_PHASES];
+    int n;
+} openfish_cuda_async_timing_t;
 
 static void openfish_decode_stats_note_dims(
     openfish_decode_stats_t *stats,
@@ -25,6 +41,43 @@ static void openfish_decode_stats_note_dims(
     stats->n_channels = n_channels;
 }
 
+static openfish_cuda_async_timing_t *openfish_async_timing_ensure(openfish_decode_stats_t *stats) {
+    if (stats->async_timing == NULL) {
+        openfish_cuda_async_timing_t *t =
+            (openfish_cuda_async_timing_t *)calloc(1, sizeof(openfish_cuda_async_timing_t));
+        MALLOC_CHK(t);
+        stats->async_timing = t;
+    }
+    return (openfish_cuda_async_timing_t *)stats->async_timing;
+}
+
+static void openfish_async_timing_record(
+    openfish_decode_stats_t *stats,
+    double *accum_field,
+    cudaStream_t stream,
+    int is_start
+) {
+    openfish_cuda_async_timing_t *t = openfish_async_timing_ensure(stats);
+    if (is_start) {
+        if (t->n >= OPENFISH_DECODE_MAX_PHASES) {
+            OPENFISH_ERROR("%s", "too many decode timing phases");
+            exit(EXIT_FAILURE);
+        }
+        cudaEventCreate(&t->start[t->n]);
+        checkCudaError();
+        cudaEventCreate(&t->end[t->n]);
+        checkCudaError();
+        t->accum[t->n] = accum_field;
+        cudaEventRecord(t->start[t->n], stream);
+        checkCudaError();
+    } else {
+        cudaEventRecord(t->end[t->n], stream);
+        checkCudaError();
+        t->n += 1;
+    }
+}
+
+/* Host-wall timing (serial path). */
 #define OPENFISH_TIME_SECTION(stats_ptr, field, ...) \
     do { \
         double _openfish_t0 = 0.0; \
@@ -38,6 +91,37 @@ static void openfish_decode_stats_note_dims(
             (stats_ptr)->field += _openfish_t1 - _openfish_t0; \
         } \
     } while (0)
+
+/* CUDA-event timing for overlap path: record only; resolve in openfish_decode_stats_finish. */
+#define OPENFISH_TIME_SECTION_ASYNC(stats_ptr, field, stream_handle, ...) \
+    do { \
+        if ((stats_ptr) != NULL) { \
+            openfish_async_timing_record((stats_ptr), &(stats_ptr)->field, (stream_handle), 1); \
+        } \
+        __VA_ARGS__ \
+        if ((stats_ptr) != NULL) { \
+            openfish_async_timing_record((stats_ptr), &(stats_ptr)->field, (stream_handle), 0); \
+        } \
+    } while (0)
+
+void openfish_decode_stats_finish(openfish_decode_stats_t *stats) {
+    if (stats == NULL || stats->async_timing == NULL) {
+        return;
+    }
+    openfish_cuda_async_timing_t *t = (openfish_cuda_async_timing_t *)stats->async_timing;
+    for (int i = 0; i < t->n; ++i) {
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, t->start[i], t->end[i]);
+        checkCudaError();
+        if (t->accum[i] != NULL) {
+            *(t->accum[i]) += (double)ms / 1000.0;
+        }
+        cudaEventDestroy(t->start[i]);
+        cudaEventDestroy(t->end[i]);
+    }
+    free(t);
+    stats->async_timing = NULL;
+}
 
 openfish_gpubuf_t *openfish_gpubuf_init(
     int n_timesteps,
@@ -107,6 +191,26 @@ void openfish_gpubuf_free(
     free(gpubuf);
 }
 
+/* Pick event-based timing when overlapping (stream != NULL); else host timers. */
+#define OPENFISH_TIME_DECODE(stats_ptr, field, stream_handle, overlap, ...) \
+    do { \
+        if ((overlap) && (stats_ptr) != NULL) { \
+            OPENFISH_TIME_SECTION_ASYNC((stats_ptr), field, (stream_handle), __VA_ARGS__); \
+        } else { \
+            OPENFISH_TIME_SECTION((stats_ptr), field, __VA_ARGS__); \
+        } \
+    } while (0)
+
+/* Legacy path (stream == NULL): device-sync when collecting stats so per-phase
+ * timers stay meaningful. Overlap path skips this via overlap_async. */
+#define OPENFISH_PHASE_SYNC(stats_ptr) \
+    do { \
+        if ((stats_ptr) != NULL) { \
+            cudaDeviceSynchronize(); \
+            checkCudaError(); \
+        } \
+    } while (0)
+
 void openfish_decode_gpu(
     int n_timesteps,
     int batch_size,
@@ -120,9 +224,11 @@ void openfish_decode_gpu(
     uint8_t **moves,
     char **sequence,
     char **qstring,
-    openfish_decode_stats_t *stats
+    openfish_decode_stats_t *stats,
+    void *stream
 ) {
     const int num_states = pow(NUM_BASES, state_len);
+    cudaStream_t s = (stream != NULL) ? (cudaStream_t)stream : (cudaStream_t)0;
 
     // calculate grid / block dims
     const int target_block_width = (int)ceil(sqrt((float)num_states));
@@ -149,19 +255,29 @@ void openfish_decode_gpu(
     scan_args.fixed_stay_score = options->blank_score;
     scan_args.score_scale = score_scale;
 
-    // init results
-    *moves = (uint8_t *)malloc(batch_size * n_timesteps * sizeof(uint8_t));
-    MALLOC_CHK(*moves);
-    *sequence = (char *)malloc(batch_size * n_timesteps * sizeof(char));
-    MALLOC_CHK(*sequence);
-    *qstring = (char *)malloc(batch_size * n_timesteps * sizeof(char));
-    MALLOC_CHK(*qstring);
+    // Pinned host buffers so D2H cudaMemcpyAsync does not implicitly sync on pageable memory.
+    cudaError_t herr;
+    herr = cudaHostAlloc((void **)moves, batch_size * n_timesteps * sizeof(uint8_t), cudaHostAllocDefault);
+    if (herr != cudaSuccess) {
+        OPENFISH_ERROR("cudaHostAlloc(moves) failed: %s", cudaGetErrorString(herr));
+        exit(EXIT_FAILURE);
+    }
+    herr = cudaHostAlloc((void **)sequence, batch_size * n_timesteps * sizeof(char), cudaHostAllocDefault);
+    if (herr != cudaSuccess) {
+        OPENFISH_ERROR("cudaHostAlloc(sequence) failed: %s", cudaGetErrorString(herr));
+        exit(EXIT_FAILURE);
+    }
+    herr = cudaHostAlloc((void **)qstring, batch_size * n_timesteps * sizeof(char), cudaHostAllocDefault);
+    if (herr != cudaSuccess) {
+        OPENFISH_ERROR("cudaHostAlloc(qstring) failed: %s", cudaGetErrorString(herr));
+        exit(EXIT_FAILURE);
+    }
 
-    cudaMemset(gpubuf->moves, 0, sizeof(uint8_t) * batch_size * n_timesteps);
+    cudaMemsetAsync(gpubuf->moves, 0, sizeof(uint8_t) * batch_size * n_timesteps, s);
 	checkCudaError();
-    cudaMemset(gpubuf->sequence, 0, sizeof(char) * batch_size * n_timesteps);
+    cudaMemsetAsync(gpubuf->sequence, 0, sizeof(char) * batch_size * n_timesteps, s);
 	checkCudaError();
-    cudaMemset(gpubuf->qstring, 0, sizeof(char) * batch_size * n_timesteps);
+    cudaMemsetAsync(gpubuf->qstring, 0, sizeof(char) * batch_size * n_timesteps, s);
 	checkCudaError();
 
     const int num_state_bits = (int)log2((double)num_states);
@@ -176,72 +292,65 @@ void openfish_decode_gpu(
     beam_args.n_channels = n_channels;
     beam_args.num_state_bits = num_state_bits;
 
-    // bwd scan
-    // fwd + post scan
-    // beam search
-
     // the compact_offsets prefix-sum view overlays cand_scratch in the beam_search kernel,
     // so the int offsets must fit within the bool bloom-filter storage.
     ASSERT(MAX_BEAM_CANDIDATES * sizeof(int) <= HASH_PRESENT_BITS * sizeof(bool));
 
     // scores are read (and dequantized via score_scale) in three kernels; instantiate each on the
     // score element type. the f16 path passes score_scale = 1.0 and is numerically unchanged.
+    // When stream != NULL (overlap), skip mid-phase syncs entirely so infer can run concurrently.
+    const int overlap_async = (stream != NULL);
+
     OPENFISH_LOG_TRACE("bwd scan / beam search / fwd + post scan (score_dtype=%d)...", (int)score_dtype);
     if (score_dtype == OPENFISH_SCORE_I8) {
-        OPENFISH_TIME_SECTION(stats, time_bwd_scan,
-            bwd_scan<int8_t><<<grid_size,block_size>>>(scan_args, scores_NTC, gpubuf->bwd_NTC);
+        OPENFISH_TIME_DECODE(stats, time_bwd_scan, s, overlap_async,
+            bwd_scan<int8_t><<<grid_size,block_size,0,s>>>(scan_args, scores_NTC, gpubuf->bwd_NTC);
             checkCudaError();
-            cudaDeviceSynchronize();
-            checkCudaError();
+            if (!overlap_async) { OPENFISH_PHASE_SYNC(stats); }
         );
 
-        OPENFISH_TIME_SECTION(stats, time_beam_search,
-            beam_search<int8_t><<<grid_size,block_size_beam,num_states*sizeof(float)>>>(
+        OPENFISH_TIME_DECODE(stats, time_beam_search, s, overlap_async,
+            beam_search<int8_t><<<grid_size,block_size_beam,num_states*sizeof(float),s>>>(
                 beam_args, scores_NTC, gpubuf->bwd_NTC,
                 (state_t *)gpubuf->states, gpubuf->moves, (beam_element_t *)gpubuf->beam_vector,
                 beam_cut, fixed_stay_score, score_scale
             );
             checkCudaError();
-            cudaDeviceSynchronize();
-            checkCudaError();
+            if (!overlap_async) { OPENFISH_PHASE_SYNC(stats); }
         );
 
-        OPENFISH_TIME_SECTION(stats, time_fwd_post_scan,
-            fwd_post_scan<int8_t><<<grid_size,block_size>>>(scan_args, scores_NTC, gpubuf->bwd_NTC, gpubuf->post_NTC);
+        OPENFISH_TIME_DECODE(stats, time_fwd_post_scan, s, overlap_async,
+            fwd_post_scan<int8_t><<<grid_size,block_size,0,s>>>(scan_args, scores_NTC, gpubuf->bwd_NTC, gpubuf->post_NTC);
             checkCudaError();
-            cudaDeviceSynchronize();
-            checkCudaError();
+            if (!overlap_async) { OPENFISH_PHASE_SYNC(stats); }
         );
     } else {
-        OPENFISH_TIME_SECTION(stats, time_bwd_scan,
-            bwd_scan<half><<<grid_size,block_size>>>(scan_args, scores_NTC, gpubuf->bwd_NTC);
+        OPENFISH_TIME_DECODE(stats, time_bwd_scan, s, overlap_async,
+            bwd_scan<half><<<grid_size,block_size,0,s>>>(scan_args, scores_NTC, gpubuf->bwd_NTC);
             checkCudaError();
-            cudaDeviceSynchronize();
-            checkCudaError();
+            if (!overlap_async) { OPENFISH_PHASE_SYNC(stats); }
         );
 
-        OPENFISH_TIME_SECTION(stats, time_beam_search,
-            beam_search<half><<<grid_size,block_size_beam,num_states*sizeof(float)>>>(
+        OPENFISH_TIME_DECODE(stats, time_beam_search, s, overlap_async,
+            beam_search<half><<<grid_size,block_size_beam,num_states*sizeof(float),s>>>(
                 beam_args, scores_NTC, gpubuf->bwd_NTC,
                 (state_t *)gpubuf->states, gpubuf->moves, (beam_element_t *)gpubuf->beam_vector,
                 beam_cut, fixed_stay_score, score_scale
             );
             checkCudaError();
-            cudaDeviceSynchronize();
-            checkCudaError();
+            if (!overlap_async) { OPENFISH_PHASE_SYNC(stats); }
         );
 
-        OPENFISH_TIME_SECTION(stats, time_fwd_post_scan,
-            fwd_post_scan<half><<<grid_size,block_size>>>(scan_args, scores_NTC, gpubuf->bwd_NTC, gpubuf->post_NTC);
+        OPENFISH_TIME_DECODE(stats, time_fwd_post_scan, s, overlap_async,
+            fwd_post_scan<half><<<grid_size,block_size,0,s>>>(scan_args, scores_NTC, gpubuf->bwd_NTC, gpubuf->post_NTC);
             checkCudaError();
-            cudaDeviceSynchronize();
-            checkCudaError();
+            if (!overlap_async) { OPENFISH_PHASE_SYNC(stats); }
         );
     }
 
     OPENFISH_LOG_TRACE("%s", "compute qual data...");
-    OPENFISH_TIME_SECTION(stats, time_qual_data,
-        compute_qual_data<<<grid_size,block_size_gen>>>(
+    OPENFISH_TIME_DECODE(stats, time_qual_data, s, overlap_async,
+        compute_qual_data<<<grid_size,block_size_gen,0,s>>>(
             beam_args,
             gpubuf->post_NTC,
             (state_t *)gpubuf->states,
@@ -249,13 +358,12 @@ void openfish_decode_gpu(
             1.0f
         );
         checkCudaError();
-        cudaDeviceSynchronize();
-        checkCudaError();
+        if (!overlap_async) { OPENFISH_PHASE_SYNC(stats); }
     );
 
     OPENFISH_LOG_TRACE("%s", "gen sequence...");
-    OPENFISH_TIME_SECTION(stats, time_gen_sequence,
-        generate_sequence<<<grid_size,block_size_gen>>>(
+    OPENFISH_TIME_DECODE(stats, time_gen_sequence, s, overlap_async,
+        generate_sequence<<<grid_size,block_size_gen,0,s>>>(
             beam_args,
             gpubuf->moves,
             (state_t *)gpubuf->states,
@@ -268,17 +376,42 @@ void openfish_decode_gpu(
             q_scale
         );
         checkCudaError();
-        cudaDeviceSynchronize();
-        checkCudaError();
+        if (!overlap_async) { OPENFISH_PHASE_SYNC(stats); }
     );
 
-    OPENFISH_TIME_SECTION(stats, time_d2h_copy,
-        cudaMemcpy(*moves, gpubuf->moves, sizeof(uint8_t) * batch_size * n_timesteps, cudaMemcpyDeviceToHost);
+    OPENFISH_TIME_DECODE(stats, time_d2h_copy, s, overlap_async,
+        cudaMemcpyAsync(*moves, gpubuf->moves, sizeof(uint8_t) * batch_size * n_timesteps, cudaMemcpyDeviceToHost, s);
         checkCudaError();
-        cudaMemcpy(*sequence, gpubuf->sequence, sizeof(char) * batch_size * n_timesteps, cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(*sequence, gpubuf->sequence, sizeof(char) * batch_size * n_timesteps, cudaMemcpyDeviceToHost, s);
         checkCudaError();
-        cudaMemcpy(*qstring, gpubuf->qstring, sizeof(char) * batch_size * n_timesteps, cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(*qstring, gpubuf->qstring, sizeof(char) * batch_size * n_timesteps, cudaMemcpyDeviceToHost, s);
         checkCudaError();
+        /* Legacy / serial path: make host buffers valid before return.
+         * Overlap path (stream != NULL): leave async — caller must sync the stream
+         * before reading moves/sequence/qstring so infer can run concurrently. */
+        if (stream == NULL) {
+            cudaStreamSynchronize(s);
+            checkCudaError();
+        }
     );
+}
+
+void openfish_decode_free_host(
+    uint8_t *moves,
+    char *sequence,
+    char *qstring
+) {
+    if (moves) {
+        cudaFreeHost(moves);
+        checkCudaError();
+    }
+    if (sequence) {
+        cudaFreeHost(sequence);
+        checkCudaError();
+    }
+    if (qstring) {
+        cudaFreeHost(qstring);
+        checkCudaError();
+    }
 }
 
