@@ -1,7 +1,7 @@
 /** Riley Updates (Remove at the end)
  * @file openfish.h
- * @lastmodified: Decode API now takes an optional GPU stream, exposes phase timing stats, and frees pinned host decode buffers.
- * @lastpatched: 2026-07-14
+ * @lastmodified: Added persistent pinned host decode buffers (moves_host/sequence_host/qstring_host) on openfish_gpubuf_t for reuse across batches.
+ * @lastpatched: 2026-07-18
 
 ******************************************************************************/
 
@@ -21,14 +21,18 @@ extern "C" {
 typedef struct openfish_gpubuf {
     float *bwd_NTC;
     float *post_NTC;
-    uint8_t *moves;
-    char *sequence;
-    char *qstring;
+    uint8_t *moves;        /* device */
+    char *sequence;        /* device */
+    char *qstring;         /* device */
     void *beam_vector;
     void *states;
     float *qual_data;
     float *base_probs;
     float *total_probs;
+    /* Persistent pinned host output buffers (CUDA); reused every decode. NULL on HIP/Metal. */
+    uint8_t *moves_host;
+    char *sequence_host;
+    char *qstring_host;
 } openfish_gpubuf_t;
 
 typedef struct openfish_opt {
@@ -126,7 +130,8 @@ void openfish_decode_gpu(
     void *stream  /* cudaStream_t / hipStream_t; NULL = current/default stream */
 );
 
-/* Free host buffers returned by openfish_decode_gpu (CUDA uses pinned host memory). */
+/* Legacy hook after openfish_decode_gpu. On CUDA, host buffers are owned by gpubuf
+ * (no-op). HIP/Metal may still free per-call malloc'd results. */
 void openfish_decode_free_host(
     uint8_t *moves,
     char *sequence,

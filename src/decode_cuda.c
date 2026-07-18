@@ -1,7 +1,7 @@
 /** Riley Updates (Remove at the end)
  * @file decode_cuda.c
- * @lastmodified: Stream-aware CUDA decode with pinned host outputs and event-based phase timing so decode can overlap inference.
- * @lastpatched: 2026-07-14
+ * @lastmodified: Persistent pinned host decode buffers on gpubuf (alloc once / free once) so overlap no longer pays per-batch cudaFreeHost.
+ * @lastpatched: 2026-07-18
 
 ******************************************************************************/
 
@@ -159,6 +159,24 @@ openfish_gpubuf_t *openfish_gpubuf_init(
     cudaMalloc((void **)&gpubuf->total_probs, sizeof(float) * batch_size * n_timesteps);
     checkCudaError();
 
+    // Persistent pinned host return buffers (reused every decode; frees in openfish_gpubuf_free).
+    cudaError_t herr;
+    herr = cudaHostAlloc((void **)&gpubuf->moves_host, sizeof(uint8_t) * batch_size * n_timesteps, cudaHostAllocDefault);
+    if (herr != cudaSuccess) {
+        OPENFISH_ERROR("cudaHostAlloc(moves_host) failed: %s", cudaGetErrorString(herr));
+        exit(EXIT_FAILURE);
+    }
+    herr = cudaHostAlloc((void **)&gpubuf->sequence_host, sizeof(char) * batch_size * n_timesteps, cudaHostAllocDefault);
+    if (herr != cudaSuccess) {
+        OPENFISH_ERROR("cudaHostAlloc(sequence_host) failed: %s", cudaGetErrorString(herr));
+        exit(EXIT_FAILURE);
+    }
+    herr = cudaHostAlloc((void **)&gpubuf->qstring_host, sizeof(char) * batch_size * n_timesteps, cudaHostAllocDefault);
+    if (herr != cudaSuccess) {
+        OPENFISH_ERROR("cudaHostAlloc(qstring_host) failed: %s", cudaGetErrorString(herr));
+        exit(EXIT_FAILURE);
+    }
+
     return gpubuf;
 }
 
@@ -186,6 +204,13 @@ void openfish_gpubuf_free(
     cudaFree(gpubuf->base_probs);
     checkCudaError();
     cudaFree(gpubuf->total_probs);
+    checkCudaError();
+
+    cudaFreeHost(gpubuf->moves_host);
+    checkCudaError();
+    cudaFreeHost(gpubuf->sequence_host);
+    checkCudaError();
+    cudaFreeHost(gpubuf->qstring_host);
     checkCudaError();
 
     free(gpubuf);
@@ -255,23 +280,10 @@ void openfish_decode_gpu(
     scan_args.fixed_stay_score = options->blank_score;
     scan_args.score_scale = score_scale;
 
-    // Pinned host buffers so D2H cudaMemcpyAsync does not implicitly sync on pageable memory.
-    cudaError_t herr;
-    herr = cudaHostAlloc((void **)moves, batch_size * n_timesteps * sizeof(uint8_t), cudaHostAllocDefault);
-    if (herr != cudaSuccess) {
-        OPENFISH_ERROR("cudaHostAlloc(moves) failed: %s", cudaGetErrorString(herr));
-        exit(EXIT_FAILURE);
-    }
-    herr = cudaHostAlloc((void **)sequence, batch_size * n_timesteps * sizeof(char), cudaHostAllocDefault);
-    if (herr != cudaSuccess) {
-        OPENFISH_ERROR("cudaHostAlloc(sequence) failed: %s", cudaGetErrorString(herr));
-        exit(EXIT_FAILURE);
-    }
-    herr = cudaHostAlloc((void **)qstring, batch_size * n_timesteps * sizeof(char), cudaHostAllocDefault);
-    if (herr != cudaSuccess) {
-        OPENFISH_ERROR("cudaHostAlloc(qstring) failed: %s", cudaGetErrorString(herr));
-        exit(EXIT_FAILURE);
-    }
+    // Reuse persistent pinned host buffers owned by gpubuf; no per-call alloc/free.
+    *moves = gpubuf->moves_host;
+    *sequence = gpubuf->sequence_host;
+    *qstring = gpubuf->qstring_host;
 
     cudaMemsetAsync(gpubuf->moves, 0, sizeof(uint8_t) * batch_size * n_timesteps, s);
 	checkCudaError();
@@ -401,17 +413,9 @@ void openfish_decode_free_host(
     char *sequence,
     char *qstring
 ) {
-    if (moves) {
-        cudaFreeHost(moves);
-        checkCudaError();
-    }
-    if (sequence) {
-        cudaFreeHost(sequence);
-        checkCudaError();
-    }
-    if (qstring) {
-        cudaFreeHost(qstring);
-        checkCudaError();
-    }
+    // No-op: host decode buffers are persistent and owned by openfish_gpubuf_t.
+    (void)moves;
+    (void)sequence;
+    (void)qstring;
 }
 

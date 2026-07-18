@@ -1,7 +1,7 @@
 /** Riley Updates (Remove at the end)
  * @file decode_hip.c
- * @lastmodified: Matched the shared decode API (stream argument, stats, pinned free); HIP stream overlap is stubbed for now.
- * @lastpatched: 2026-07-14
+ * @lastmodified: NULL-init gpubuf host buffer fields (CUDA owns persistent pinned hosts; HIP still mallocs per decode).
+ * @lastpatched: 2026-07-18
 
 ******************************************************************************/
 
@@ -85,6 +85,11 @@ openfish_gpubuf_t *openfish_gpubuf_init(
     checkHipError(); HIP_CHECK(ret);
     ret = hipMalloc((void **)&gpubuf->total_probs, sizeof(float) * batch_size * n_timesteps);
     checkHipError(); HIP_CHECK(ret);
+
+    /* CUDA allocates persistent pinned hosts; HIP leaves these unused. */
+    gpubuf->moves_host = NULL;
+    gpubuf->sequence_host = NULL;
+    gpubuf->qstring_host = NULL;
 
     return gpubuf;
 }

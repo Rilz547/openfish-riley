@@ -1,7 +1,7 @@
 /** Riley Updates (Remove at the end)
  * @file decode_metal.mm
- * @lastmodified: Updated to the shared openfish_decode_gpu signature (stream + stats); Metal still runs on the default path.
- * @lastpatched: 2026-07-14
+ * @lastmodified: NULL-init gpubuf host buffer fields for shared struct layout (Metal still mallocs per-decode results).
+ * @lastpatched: 2026-07-18
 
 ******************************************************************************/
 
@@ -163,6 +163,10 @@ extern "C" openfish_gpubuf_t *openfish_gpubuf_init(
     mg->pub.qual_data   = (float *)[mg->qual_data contents];
     mg->pub.base_probs  = (float *)[mg->base_probs contents];
     mg->pub.total_probs = (float *)[mg->total_probs contents];
+    /* CUDA allocates persistent pinned hosts; Metal leaves these unused. */
+    mg->pub.moves_host = NULL;
+    mg->pub.sequence_host = NULL;
+    mg->pub.qstring_host = NULL;
 
     return &mg->pub;
 }
