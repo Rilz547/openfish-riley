@@ -1,6 +1,6 @@
 /** Riley Updates (Remove at the end)
  * @file openfish.h
- * @lastmodified: Added persistent pinned host decode buffers (moves_host/sequence_host/qstring_host) on openfish_gpubuf_t for reuse across batches.
+ * @lastmodified: 2-slot pinned host decode ring (OPENFISH_HOST_RING) + host_slot on openfish_decode_gpu for P5-lite.
  * @lastpatched: 2026-07-18
 
 ******************************************************************************/
@@ -18,6 +18,9 @@
 extern "C" {
 #endif
 
+/* Depth of pinned host output ring. Slot 0 is enough for serial decode; overlap/P5-lite uses both. */
+#define OPENFISH_HOST_RING 2
+
 typedef struct openfish_gpubuf {
     float *bwd_NTC;
     float *post_NTC;
@@ -29,10 +32,10 @@ typedef struct openfish_gpubuf {
     float *qual_data;
     float *base_probs;
     float *total_probs;
-    /* Persistent pinned host output buffers (CUDA); reused every decode. NULL on HIP/Metal. */
-    uint8_t *moves_host;
-    char *sequence_host;
-    char *qstring_host;
+    /* Persistent pinned host output ring (CUDA); NULL entries on HIP/Metal. */
+    uint8_t *moves_host[OPENFISH_HOST_RING];
+    char *sequence_host[OPENFISH_HOST_RING];
+    char *qstring_host[OPENFISH_HOST_RING];
 } openfish_gpubuf_t;
 
 typedef struct openfish_opt {
@@ -127,7 +130,8 @@ void openfish_decode_gpu(
     char **sequence,
     char **qstring,
     openfish_decode_stats_t *stats,
-    void *stream  /* cudaStream_t / hipStream_t; NULL = current/default stream */
+    void *stream,  /* cudaStream_t / hipStream_t; NULL = current/default stream */
+    int host_slot  /* pinned host ring index in [0, OPENFISH_HOST_RING); serial path uses 0 */
 );
 
 /* Legacy hook after openfish_decode_gpu. On CUDA, host buffers are owned by gpubuf

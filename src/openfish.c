@@ -1,6 +1,6 @@
 /** Riley Updates (Remove at the end)
  * @file openfish.c
- * @lastmodified: openfish_gpubuf_size now includes the three persistent pinned host decode buffers.
+ * @lastmodified: openfish_gpubuf_size accounts for OPENFISH_HOST_RING pinned host slots.
  * @lastpatched: 2026-07-18
 
 ******************************************************************************/
@@ -38,7 +38,9 @@ size_t openfish_gpubuf_size(
         sizeof(float) * (size_t)batch_size * n_timesteps * NUM_BASES +                  // qual_data
         sizeof(float) * (size_t)batch_size * n_timesteps +                              // base_probs
         sizeof(float) * (size_t)batch_size * n_timesteps +                              // total_probs
-        sizeof(uint8_t) * (size_t)batch_size * n_timesteps +                            // moves_host (pinned)
-        sizeof(char) * (size_t)batch_size * n_timesteps +                               // sequence_host (pinned)
-        sizeof(char) * (size_t)batch_size * n_timesteps;                                // qstring_host (pinned)
+        OPENFISH_HOST_RING * (
+            sizeof(uint8_t) * (size_t)batch_size * n_timesteps +                        // moves_host[slot]
+            sizeof(char) * (size_t)batch_size * n_timesteps +                           // sequence_host[slot]
+            sizeof(char) * (size_t)batch_size * n_timesteps                              // qstring_host[slot]
+        );
 }

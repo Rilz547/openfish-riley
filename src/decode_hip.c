@@ -86,10 +86,12 @@ openfish_gpubuf_t *openfish_gpubuf_init(
     ret = hipMalloc((void **)&gpubuf->total_probs, sizeof(float) * batch_size * n_timesteps);
     checkHipError(); HIP_CHECK(ret);
 
-    /* CUDA allocates persistent pinned hosts; HIP leaves these unused. */
-    gpubuf->moves_host = NULL;
-    gpubuf->sequence_host = NULL;
-    gpubuf->qstring_host = NULL;
+    /* CUDA allocates persistent pinned host ring; HIP leaves these unused. */
+    for (int slot = 0; slot < OPENFISH_HOST_RING; ++slot) {
+        gpubuf->moves_host[slot] = NULL;
+        gpubuf->sequence_host[slot] = NULL;
+        gpubuf->qstring_host[slot] = NULL;
+    }
 
     return gpubuf;
 }
@@ -138,9 +140,11 @@ void openfish_decode_gpu(
     char **sequence,
     char **qstring,
     openfish_decode_stats_t *stats,
-    void *stream
+    void *stream,
+    int host_slot
 ) {
     (void)stream; /* CUDA overlap streams; HIP stream path not wired yet */
+    (void)host_slot; /* pinned host ring is CUDA-only; HIP mallocs per call */
     hipError_t ret;
     const int num_states = pow(NUM_BASES, state_len);
 

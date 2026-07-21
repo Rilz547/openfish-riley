@@ -1,6 +1,6 @@
 /** Riley Updates (Remove at the end)
  * @file decode_cuda.c
- * @lastmodified: Persistent pinned host decode buffers on gpubuf (alloc once / free once) so overlap no longer pays per-batch cudaFreeHost.
+ * @lastmodified: 2-slot pinned host ring; openfish_decode_gpu takes host_slot for P5-lite overlap.
  * @lastpatched: 2026-07-18
 
 ******************************************************************************/
@@ -159,22 +159,24 @@ openfish_gpubuf_t *openfish_gpubuf_init(
     cudaMalloc((void **)&gpubuf->total_probs, sizeof(float) * batch_size * n_timesteps);
     checkCudaError();
 
-    // Persistent pinned host return buffers (reused every decode; frees in openfish_gpubuf_free).
+    // Persistent pinned host return ring (2 slots for P5-lite; frees in openfish_gpubuf_free).
     cudaError_t herr;
-    herr = cudaHostAlloc((void **)&gpubuf->moves_host, sizeof(uint8_t) * batch_size * n_timesteps, cudaHostAllocDefault);
-    if (herr != cudaSuccess) {
-        OPENFISH_ERROR("cudaHostAlloc(moves_host) failed: %s", cudaGetErrorString(herr));
-        exit(EXIT_FAILURE);
-    }
-    herr = cudaHostAlloc((void **)&gpubuf->sequence_host, sizeof(char) * batch_size * n_timesteps, cudaHostAllocDefault);
-    if (herr != cudaSuccess) {
-        OPENFISH_ERROR("cudaHostAlloc(sequence_host) failed: %s", cudaGetErrorString(herr));
-        exit(EXIT_FAILURE);
-    }
-    herr = cudaHostAlloc((void **)&gpubuf->qstring_host, sizeof(char) * batch_size * n_timesteps, cudaHostAllocDefault);
-    if (herr != cudaSuccess) {
-        OPENFISH_ERROR("cudaHostAlloc(qstring_host) failed: %s", cudaGetErrorString(herr));
-        exit(EXIT_FAILURE);
+    for (int slot = 0; slot < OPENFISH_HOST_RING; ++slot) {
+        herr = cudaHostAlloc((void **)&gpubuf->moves_host[slot], sizeof(uint8_t) * batch_size * n_timesteps, cudaHostAllocDefault);
+        if (herr != cudaSuccess) {
+            OPENFISH_ERROR("cudaHostAlloc(moves_host[%d]) failed: %s", slot, cudaGetErrorString(herr));
+            exit(EXIT_FAILURE);
+        }
+        herr = cudaHostAlloc((void **)&gpubuf->sequence_host[slot], sizeof(char) * batch_size * n_timesteps, cudaHostAllocDefault);
+        if (herr != cudaSuccess) {
+            OPENFISH_ERROR("cudaHostAlloc(sequence_host[%d]) failed: %s", slot, cudaGetErrorString(herr));
+            exit(EXIT_FAILURE);
+        }
+        herr = cudaHostAlloc((void **)&gpubuf->qstring_host[slot], sizeof(char) * batch_size * n_timesteps, cudaHostAllocDefault);
+        if (herr != cudaSuccess) {
+            OPENFISH_ERROR("cudaHostAlloc(qstring_host[%d]) failed: %s", slot, cudaGetErrorString(herr));
+            exit(EXIT_FAILURE);
+        }
     }
 
     return gpubuf;
@@ -206,12 +208,14 @@ void openfish_gpubuf_free(
     cudaFree(gpubuf->total_probs);
     checkCudaError();
 
-    cudaFreeHost(gpubuf->moves_host);
-    checkCudaError();
-    cudaFreeHost(gpubuf->sequence_host);
-    checkCudaError();
-    cudaFreeHost(gpubuf->qstring_host);
-    checkCudaError();
+    for (int slot = 0; slot < OPENFISH_HOST_RING; ++slot) {
+        cudaFreeHost(gpubuf->moves_host[slot]);
+        checkCudaError();
+        cudaFreeHost(gpubuf->sequence_host[slot]);
+        checkCudaError();
+        cudaFreeHost(gpubuf->qstring_host[slot]);
+        checkCudaError();
+    }
 
     free(gpubuf);
 }
@@ -250,10 +254,16 @@ void openfish_decode_gpu(
     char **sequence,
     char **qstring,
     openfish_decode_stats_t *stats,
-    void *stream
+    void *stream,
+    int host_slot
 ) {
     const int num_states = pow(NUM_BASES, state_len);
     cudaStream_t s = (stream != NULL) ? (cudaStream_t)stream : (cudaStream_t)0;
+
+    if (host_slot < 0 || host_slot >= OPENFISH_HOST_RING) {
+        OPENFISH_ERROR("host_slot %d out of range [0, %d)", host_slot, OPENFISH_HOST_RING);
+        exit(EXIT_FAILURE);
+    }
 
     // calculate grid / block dims
     const int target_block_width = (int)ceil(sqrt((float)num_states));
@@ -269,7 +279,7 @@ void openfish_decode_gpu(
     dim3 block_size_gen(1, 1, 1);
 	dim3 grid_size(batch_size, 1, 1);
 
-    OPENFISH_LOG_TRACE("scores tensor dim (NTC): %d, %d, %d", batch_size, n_timesteps, n_channels);
+    OPENFISH_LOG_TRACE("scores tensor dim (NTC): %d, %d, %d (host_slot=%d)", batch_size, n_timesteps, n_channels, host_slot);
     openfish_decode_stats_note_dims(stats, n_timesteps, batch_size, n_channels);
 
     scan_params_t scan_args = {0};
@@ -280,10 +290,10 @@ void openfish_decode_gpu(
     scan_args.fixed_stay_score = options->blank_score;
     scan_args.score_scale = score_scale;
 
-    // Reuse persistent pinned host buffers owned by gpubuf; no per-call alloc/free.
-    *moves = gpubuf->moves_host;
-    *sequence = gpubuf->sequence_host;
-    *qstring = gpubuf->qstring_host;
+    // Reuse persistent pinned host ring slot; no per-call alloc/free.
+    *moves = gpubuf->moves_host[host_slot];
+    *sequence = gpubuf->sequence_host[host_slot];
+    *qstring = gpubuf->qstring_host[host_slot];
 
     cudaMemsetAsync(gpubuf->moves, 0, sizeof(uint8_t) * batch_size * n_timesteps, s);
 	checkCudaError();

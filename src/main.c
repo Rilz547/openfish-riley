@@ -183,7 +183,7 @@ int main(int argc, char* argv[]) {
 
     // decode scores
 #if defined HAVE_GPU
-        openfish_decode_gpu(n_timesteps, batch_size, n_channels, scores_gpu, of_dtype, of_scale, state_len, &options, gpubuf, &moves, &sequence, &qstring, NULL, NULL);
+        openfish_decode_gpu(n_timesteps, batch_size, n_channels, scores_gpu, of_dtype, of_scale, state_len, &options, gpubuf, &moves, &sequence, &qstring, NULL, NULL, 0);
 #else
         int n_threads = 8;
         openfish_decode_cpu(n_timesteps, batch_size, n_channels, n_threads, scores, of_dtype, of_scale, state_len, &options, &moves, &sequence, &qstring, NULL);

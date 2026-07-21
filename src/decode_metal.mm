@@ -163,10 +163,12 @@ extern "C" openfish_gpubuf_t *openfish_gpubuf_init(
     mg->pub.qual_data   = (float *)[mg->qual_data contents];
     mg->pub.base_probs  = (float *)[mg->base_probs contents];
     mg->pub.total_probs = (float *)[mg->total_probs contents];
-    /* CUDA allocates persistent pinned hosts; Metal leaves these unused. */
-    mg->pub.moves_host = NULL;
-    mg->pub.sequence_host = NULL;
-    mg->pub.qstring_host = NULL;
+    /* CUDA allocates persistent pinned host ring; Metal leaves these unused. */
+    for (int slot = 0; slot < OPENFISH_HOST_RING; ++slot) {
+        mg->pub.moves_host[slot] = NULL;
+        mg->pub.sequence_host[slot] = NULL;
+        mg->pub.qstring_host[slot] = NULL;
+    }
 
     return &mg->pub;
 }
@@ -193,11 +195,13 @@ extern "C" void openfish_decode_gpu(
     char **sequence,
     char **qstring,
     openfish_decode_stats_t *stats,
-    void *stream
+    void *stream,
+    int host_slot
 ) {
     ensure_metal_init();
     (void)stats;
     (void)stream;
+    (void)host_slot;
 
     // The Metal path currently supports float16 scores only; int8 decode is
     // wired for the CUDA/HIP backends. score_scale is honored in the beam search.
