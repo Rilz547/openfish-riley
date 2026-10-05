@@ -36,6 +36,9 @@ typedef struct openfish_gpubuf {
     uint8_t *moves_host[OPENFISH_HOST_RING];
     char *sequence_host[OPENFISH_HOST_RING];
     char *qstring_host[OPENFISH_HOST_RING];
+    /* Per-chunk greedy decision margin (speculative decode): device buffer + pinned host ring. */
+    float *margins;
+    float *margins_host[OPENFISH_HOST_RING];
 } openfish_gpubuf_t;
 
 typedef struct openfish_opt {
@@ -58,6 +61,7 @@ typedef enum {
 typedef struct openfish_decode_stats {
     double time_bwd_scan;
     double time_beam_search;
+    double time_draft;         /* greedy draft kernel (speculative decode) */
     double time_fwd_post_scan;
     double time_qual_data;
     double time_gen_sequence;
@@ -132,6 +136,30 @@ void openfish_decode_gpu(
     openfish_decode_stats_t *stats,
     void *stream,  /* cudaStream_t / hipStream_t; NULL = current/default stream */
     int host_slot  /* pinned host ring index in [0, OPENFISH_HOST_RING); serial path uses 0 */
+);
+
+/* Greedy (width-1) draft decode for speculative decode. Same pipeline and output layout as
+ * openfish_decode_gpu, but the beam search is replaced by a single greedy walk through the CRF.
+ * *margins receives a host pointer (pinned ring slot host_slot) to one float per chunk: the mean
+ * (best - second best) transition score along the greedy path. Like moves/sequence/qstring, it is
+ * only valid once the stream has been synchronized, and until the next decode on the same slot. */
+void openfish_decode_gpu_greedy(
+    int n_timesteps,
+    int batch_size,
+    int n_channels,
+    const void *scores_NTC,
+    openfish_score_dtype_t score_dtype,
+    float score_scale,
+    int state_len,
+    const openfish_opt_t *options,
+    const openfish_gpubuf_t *gpubuf,
+    uint8_t **moves,
+    char **sequence,
+    char **qstring,
+    float **margins,
+    openfish_decode_stats_t *stats,
+    void *stream,
+    int host_slot
 );
 
 /* Legacy hook after openfish_decode_gpu. On CUDA, host buffers are owned by gpubuf

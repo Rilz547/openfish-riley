@@ -41,6 +41,8 @@ size_t openfish_gpubuf_size(
         OPENFISH_HOST_RING * (
             sizeof(uint8_t) * (size_t)batch_size * n_timesteps +                        // moves_host[slot]
             sizeof(char) * (size_t)batch_size * n_timesteps +                           // sequence_host[slot]
-            sizeof(char) * (size_t)batch_size * n_timesteps                              // qstring_host[slot]
-        );
+            sizeof(char) * (size_t)batch_size * n_timesteps +                           // qstring_host[slot]
+            sizeof(float) * (size_t)batch_size                                          // margins_host[slot]
+        ) +
+        sizeof(float) * (size_t)batch_size;                                             // margins (device)
 }

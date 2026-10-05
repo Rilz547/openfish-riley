@@ -10,6 +10,7 @@
 #include "openfish_defs.h"
 #include "scan_cuda.h"
 #include "beam_search_cuda.h"
+#include "greedy_search_cuda.h"
 #include "error.h"
 #include "cuda_utils.h"
 #include "misc.h"
@@ -18,7 +19,7 @@
 
 #include <cuda_fp16.h>
 
-#define OPENFISH_DECODE_MAX_PHASES 8
+#define OPENFISH_DECODE_MAX_PHASES 24
 
 typedef struct {
     cudaEvent_t start[OPENFISH_DECODE_MAX_PHASES];
@@ -159,6 +160,10 @@ openfish_gpubuf_t *openfish_gpubuf_init(
     cudaMalloc((void **)&gpubuf->total_probs, sizeof(float) * batch_size * n_timesteps);
     checkCudaError();
 
+    // greedy draft decision margins (one float per chunk)
+    cudaMalloc((void **)&gpubuf->margins, sizeof(float) * batch_size);
+    checkCudaError();
+
     // Persistent pinned host return ring (2 slots for P5-lite; frees in openfish_gpubuf_free).
     cudaError_t herr;
     for (int slot = 0; slot < OPENFISH_HOST_RING; ++slot) {
@@ -175,6 +180,11 @@ openfish_gpubuf_t *openfish_gpubuf_init(
         herr = cudaHostAlloc((void **)&gpubuf->qstring_host[slot], sizeof(char) * batch_size * n_timesteps, cudaHostAllocDefault);
         if (herr != cudaSuccess) {
             OPENFISH_ERROR("cudaHostAlloc(qstring_host[%d]) failed: %s", slot, cudaGetErrorString(herr));
+            exit(EXIT_FAILURE);
+        }
+        herr = cudaHostAlloc((void **)&gpubuf->margins_host[slot], sizeof(float) * batch_size, cudaHostAllocDefault);
+        if (herr != cudaSuccess) {
+            OPENFISH_ERROR("cudaHostAlloc(margins_host[%d]) failed: %s", slot, cudaGetErrorString(herr));
             exit(EXIT_FAILURE);
         }
     }
@@ -207,6 +217,8 @@ void openfish_gpubuf_free(
     checkCudaError();
     cudaFree(gpubuf->total_probs);
     checkCudaError();
+    cudaFree(gpubuf->margins);
+    checkCudaError();
 
     for (int slot = 0; slot < OPENFISH_HOST_RING; ++slot) {
         cudaFreeHost(gpubuf->moves_host[slot]);
@@ -214,6 +226,8 @@ void openfish_gpubuf_free(
         cudaFreeHost(gpubuf->sequence_host[slot]);
         checkCudaError();
         cudaFreeHost(gpubuf->qstring_host[slot]);
+        checkCudaError();
+        cudaFreeHost(gpubuf->margins_host[slot]);
         checkCudaError();
     }
 
@@ -240,7 +254,10 @@ void openfish_gpubuf_free(
         } \
     } while (0)
 
-void openfish_decode_gpu(
+// Shared body of openfish_decode_gpu (beam) and openfish_decode_gpu_greedy (draft). The two differ only
+// in which kernel turns the back guides into a path; scans, qualities, sequence generation and the D2H
+// copies are identical. margins is non-NULL only for the greedy draft.
+static void decode_gpu_impl(
     int n_timesteps,
     int batch_size,
     int n_channels,
@@ -253,6 +270,8 @@ void openfish_decode_gpu(
     uint8_t **moves,
     char **sequence,
     char **qstring,
+    float **margins,
+    int greedy,
     openfish_decode_stats_t *stats,
     void *stream,
     int host_slot
@@ -294,6 +313,9 @@ void openfish_decode_gpu(
     *moves = gpubuf->moves_host[host_slot];
     *sequence = gpubuf->sequence_host[host_slot];
     *qstring = gpubuf->qstring_host[host_slot];
+    if (greedy && margins != NULL) {
+        *margins = gpubuf->margins_host[host_slot];
+    }
 
     cudaMemsetAsync(gpubuf->moves, 0, sizeof(uint8_t) * batch_size * n_timesteps, s);
 	checkCudaError();
@@ -331,15 +353,27 @@ void openfish_decode_gpu(
             if (!overlap_async) { OPENFISH_PHASE_SYNC(stats); }
         );
 
-        OPENFISH_TIME_DECODE(stats, time_beam_search, s, overlap_async,
-            beam_search<int8_t><<<grid_size,block_size_beam,num_states*sizeof(float),s>>>(
-                beam_args, scores_NTC, gpubuf->bwd_NTC,
-                (state_t *)gpubuf->states, gpubuf->moves, (beam_element_t *)gpubuf->beam_vector,
-                beam_cut, fixed_stay_score, score_scale
+        if (greedy) {
+            OPENFISH_TIME_DECODE(stats, time_draft, s, overlap_async,
+                greedy_search<int8_t><<<grid_size,block_size_gen,0,s>>>(
+                    beam_args, scores_NTC, gpubuf->bwd_NTC,
+                    (state_t *)gpubuf->states, gpubuf->moves, gpubuf->margins,
+                    fixed_stay_score, score_scale
+                );
+                checkCudaError();
+                if (!overlap_async) { OPENFISH_PHASE_SYNC(stats); }
             );
-            checkCudaError();
-            if (!overlap_async) { OPENFISH_PHASE_SYNC(stats); }
-        );
+        } else {
+            OPENFISH_TIME_DECODE(stats, time_beam_search, s, overlap_async,
+                beam_search<int8_t><<<grid_size,block_size_beam,num_states*sizeof(float),s>>>(
+                    beam_args, scores_NTC, gpubuf->bwd_NTC,
+                    (state_t *)gpubuf->states, gpubuf->moves, (beam_element_t *)gpubuf->beam_vector,
+                    beam_cut, fixed_stay_score, score_scale
+                );
+                checkCudaError();
+                if (!overlap_async) { OPENFISH_PHASE_SYNC(stats); }
+            );
+        }
 
         OPENFISH_TIME_DECODE(stats, time_fwd_post_scan, s, overlap_async,
             fwd_post_scan<int8_t><<<grid_size,block_size,0,s>>>(scan_args, scores_NTC, gpubuf->bwd_NTC, gpubuf->post_NTC);
@@ -353,15 +387,27 @@ void openfish_decode_gpu(
             if (!overlap_async) { OPENFISH_PHASE_SYNC(stats); }
         );
 
-        OPENFISH_TIME_DECODE(stats, time_beam_search, s, overlap_async,
-            beam_search<half><<<grid_size,block_size_beam,num_states*sizeof(float),s>>>(
-                beam_args, scores_NTC, gpubuf->bwd_NTC,
-                (state_t *)gpubuf->states, gpubuf->moves, (beam_element_t *)gpubuf->beam_vector,
-                beam_cut, fixed_stay_score, score_scale
+        if (greedy) {
+            OPENFISH_TIME_DECODE(stats, time_draft, s, overlap_async,
+                greedy_search<half><<<grid_size,block_size_gen,0,s>>>(
+                    beam_args, scores_NTC, gpubuf->bwd_NTC,
+                    (state_t *)gpubuf->states, gpubuf->moves, gpubuf->margins,
+                    fixed_stay_score, score_scale
+                );
+                checkCudaError();
+                if (!overlap_async) { OPENFISH_PHASE_SYNC(stats); }
             );
-            checkCudaError();
-            if (!overlap_async) { OPENFISH_PHASE_SYNC(stats); }
-        );
+        } else {
+            OPENFISH_TIME_DECODE(stats, time_beam_search, s, overlap_async,
+                beam_search<half><<<grid_size,block_size_beam,num_states*sizeof(float),s>>>(
+                    beam_args, scores_NTC, gpubuf->bwd_NTC,
+                    (state_t *)gpubuf->states, gpubuf->moves, (beam_element_t *)gpubuf->beam_vector,
+                    beam_cut, fixed_stay_score, score_scale
+                );
+                checkCudaError();
+                if (!overlap_async) { OPENFISH_PHASE_SYNC(stats); }
+            );
+        }
 
         OPENFISH_TIME_DECODE(stats, time_fwd_post_scan, s, overlap_async,
             fwd_post_scan<half><<<grid_size,block_size,0,s>>>(scan_args, scores_NTC, gpubuf->bwd_NTC, gpubuf->post_NTC);
@@ -408,6 +454,10 @@ void openfish_decode_gpu(
         checkCudaError();
         cudaMemcpyAsync(*qstring, gpubuf->qstring, sizeof(char) * batch_size * n_timesteps, cudaMemcpyDeviceToHost, s);
         checkCudaError();
+        if (greedy) {
+            cudaMemcpyAsync(gpubuf->margins_host[host_slot], gpubuf->margins, sizeof(float) * batch_size, cudaMemcpyDeviceToHost, s);
+            checkCudaError();
+        }
         /* Legacy / serial path: make host buffers valid before return.
          * Overlap path (stream != NULL): leave async — caller must sync the stream
          * before reading moves/sequence/qstring so infer can run concurrently. */
@@ -415,6 +465,53 @@ void openfish_decode_gpu(
             cudaStreamSynchronize(s);
             checkCudaError();
         }
+    );
+}
+
+void openfish_decode_gpu(
+    int n_timesteps,
+    int batch_size,
+    int n_channels,
+    const void *scores_NTC,
+    openfish_score_dtype_t score_dtype,
+    float score_scale,
+    int state_len,
+    const openfish_opt_t *options,
+    const openfish_gpubuf_t *gpubuf,
+    uint8_t **moves,
+    char **sequence,
+    char **qstring,
+    openfish_decode_stats_t *stats,
+    void *stream,
+    int host_slot
+) {
+    decode_gpu_impl(
+        n_timesteps, batch_size, n_channels, scores_NTC, score_dtype, score_scale, state_len,
+        options, gpubuf, moves, sequence, qstring, NULL, 0, stats, stream, host_slot
+    );
+}
+
+void openfish_decode_gpu_greedy(
+    int n_timesteps,
+    int batch_size,
+    int n_channels,
+    const void *scores_NTC,
+    openfish_score_dtype_t score_dtype,
+    float score_scale,
+    int state_len,
+    const openfish_opt_t *options,
+    const openfish_gpubuf_t *gpubuf,
+    uint8_t **moves,
+    char **sequence,
+    char **qstring,
+    float **margins,
+    openfish_decode_stats_t *stats,
+    void *stream,
+    int host_slot
+) {
+    decode_gpu_impl(
+        n_timesteps, batch_size, n_channels, scores_NTC, score_dtype, score_scale, state_len,
+        options, gpubuf, moves, sequence, qstring, margins, 1, stats, stream, host_slot
     );
 }
 
